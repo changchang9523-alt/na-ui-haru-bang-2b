@@ -20,7 +20,7 @@
   const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 80);
   camera.position.set(0, 2.2, 5.5);
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.1));
   renderer.outputEncoding = THREE.sRGBEncoding;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   // Keep pale upholstery and the oak desktop from clipping to white. The
@@ -28,6 +28,7 @@
   renderer.toneMappingExposure = .8;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false; renderer.shadowMap.needsUpdate = true; // v56: the room is static, so shadows are refreshed a few times a second instead of every frame
   renderer.domElement.id = "room3dCanvas";
   renderer.domElement.setAttribute("aria-hidden", "true");
   layer.insertBefore(renderer.domElement, photo);
@@ -1004,7 +1005,9 @@
     box(4.4,.024,2.9,mat(0xb9ac93,1),0,.021,0,rug,false);
     // knotted fringe on the short ends
     const fringeMat=mat(0xe7dcc6,.95);
-    for(const sx of [-1,1])for(let i=0;i<70;i++){const f=box(.075,.004,.006,fringeMat,sx*(2.2+.035),.014,-1.42+i*(2.84/69),rug,false);f.rotation.y=(Math.random()-.5)*.5;}
+    const fringe=new THREE.InstancedMesh(new THREE.BoxGeometry(.075,.004,.006),fringeMat,140),fm=new THREE.Object3D();
+    for(let n=0;n<140;n++){const sx=n<70?-1:1,i=n%70;fm.position.set(sx*(2.2+.035),.014,-1.42+i*(2.84/69));fm.rotation.set(0,(Math.random()-.5)*.5,0);fm.updateMatrix();fringe.setMatrixAt(n,fm.matrix);}
+    rug.add(fringe);
   }
   // v52: black tufted leather sofa (deep buttoned back and rolled arms).
   const tuftCanvas=document.createElement("canvas");tuftCanvas.width=512;tuftCanvas.height=256;
@@ -1148,7 +1151,7 @@
   const sunlight = new THREE.DirectionalLight(0x9dadce, .42);
   sunlight.position.set(-3.8, 5.2, -5.4);
   sunlight.target.position.set(-.15, 1.05, 1.15);
-  sunlight.intensity=0; sunlight.castShadow = true; sunlight.shadow.mapSize.set(3072, 3072); sunlight.shadow.bias = -0.00025; sunlight.shadow.normalBias = 0.018; sunlight.shadow.radius = 3; sunlight.shadow.camera.left = -7; sunlight.shadow.camera.right = 7; sunlight.shadow.camera.top = 7; sunlight.shadow.camera.bottom = -4; scene.add(sunlight, sunlight.target);
+  sunlight.intensity=0; sunlight.visible=false; sunlight.castShadow = false; sunlight.shadow.mapSize.set(1024, 1024); sunlight.shadow.bias = -0.00025; sunlight.shadow.normalBias = 0.018; sunlight.shadow.radius = 3; sunlight.shadow.camera.left = -7; sunlight.shadow.camera.right = 7; sunlight.shadow.camera.top = 7; sunlight.shadow.camera.bottom = -4; scene.add(sunlight, sunlight.target);
   const windowBounce = new THREE.DirectionalLight(0x849ac0, .03); windowBounce.position.set(-.4, 4.6, -4.5); windowBounce.target.position.set(-.2, 1.1, 1.2); scene.add(windowBounce, windowBounce.target);
 
   // Import detailed PBR assets while keeping the existing desk, room layout,
@@ -1379,8 +1382,7 @@
       }
       loadGallery();
     };
-    // The gallery is the main destination: start loading it quietly once the room is up.
-    setTimeout(loadGallery, 2500);
+    // Load the large gallery model only when the door is opened.
   };
   // Closer default framing of the desk, like the reference room.
   const ROOM_VIEW = { pos: [0, 2.2, 5.5], target: [0, 1.4, .5], min: 3.4, max: 6.4, az: .4, polar: [1.22, 1.5] };
@@ -2014,7 +2016,80 @@
       controls.enabled = true; windowMode = false; const crt = document.getElementById("crt"); if (crt) crt.style.opacity = ""; renderHints(); render(); after?.();
     });
   }
-  window.__roomCam = { camera, controls, render: () => render() };
+  // ---------- v56: draw-call batching ----------
+  // The room is built from ~950 small meshes, which cost ~1500 draw calls a
+  // frame. Once everything has loaded, static meshes that share a material are
+  // merged into one mesh each; the originals stay in the scene on a hidden
+  // layer. A light watch re-checks them twice a second: if any original moves,
+  // changes visibility or material, its batch is dissolved and the originals
+  // are shown again, so animated pieces keep working exactly as before.
+  {
+    const mergedRoot = new THREE.Group(); mergedRoot.name = "merged static room"; scene.add(mergedRoot);
+    const used = new WeakSet(), batches = [], HIDDEN = 31;
+    const okMat = m => m && !Array.isArray(m) && !m.transparent && !m.vertexColors && (m.isMeshStandardMaterial || m.isMeshBasicMaterial || m.isMeshLambertMaterial || m.isMeshPhongMaterial);
+    const u = t => t ? t.uuid : "";
+    const sig = m => [m.type, m.isMeshPhysicalMaterial || m.onBeforeCompile?.toString().length > 40 || m.userData?.noMerge ? m.uuid : "", m.color?.getHex(), m.roughness, m.metalness, m.emissive?.getHex(), m.emissiveIntensity, u(m.map), u(m.bumpMap), m.bumpScale, u(m.normalMap), u(m.roughnessMap), u(m.metalnessMap), u(m.aoMap), u(m.emissiveMap), u(m.envMap), m.envMapIntensity, m.side, m.opacity, m.flatShading, m.toneMapped, m.polygonOffset, m.depthTest, m.depthWrite, m.colorWrite, m.alphaTest, m.wireframe, m.fog].join("|");
+    const effVisible = o => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
+    const inside = (o, root) => { for (; o; o = o.parent) if (o === root) return true; return false; };
+    function prep(mesh) {
+      let g = mesh.geometry; if (!g || !g.attributes.position || g.morphAttributes?.position) return null;
+      g = g.index ? g.toNonIndexed() : g.clone();
+      for (const k of Object.keys(g.attributes)) if (!["position", "normal", "uv"].includes(k)) g.deleteAttribute(k);
+      if (!g.attributes.normal) g.computeVertexNormals();
+      if (!g.attributes.uv) g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
+      if (g.attributes.position.itemSize !== 3 || g.attributes.uv.itemSize !== 2) { g.dispose(); return null; }
+      g.applyMatrix4(mesh.matrixWorld); return g;
+    }
+    function mergeStatic() {
+      if (galleryMode) return;
+      scene.updateMatrixWorld(true);
+      const groups = new Map();
+      scene.traverse(o => {
+        if (!o.isMesh || o.isInstancedMesh || o.isSkinnedMesh || used.has(o) || o.userData.interactionProxy) return;
+        if (inside(o, galleryWorld) || inside(o, mergedRoot) || !effVisible(o) || !okMat(o.material) || o.layers.mask !== 1) return;
+        const key = sig(o.material) + "|" + o.castShadow + "|" + o.receiveShadow + "|" + o.renderOrder + "|" + (o.matrixWorld.determinant() < 0);
+        if (!groups.has(key)) groups.set(key, []); groups.get(key).push(o);
+      });
+      let saved = 0;
+      for (const list of groups.values()) {
+        if (list.length < 2) continue;
+        const geos = [], members = [];
+        for (const m of list) { const g = prep(m); if (g) { geos.push(g); members.push(m); } }
+        if (members.length < 2) { geos.forEach(g => g.dispose()); continue; }
+        let n = 0; for (const g of geos) n += g.attributes.position.count;
+        const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), uv = new Float32Array(n * 2); let o = 0;
+        for (const g of geos) { const c = g.attributes.position.count; pos.set(g.attributes.position.array, o * 3); nor.set(g.attributes.normal.array, o * 3); uv.set(g.attributes.uv.array, o * 2); o += c; g.dispose(); }
+        const geo = new THREE.BufferGeometry(); geo.setAttribute("position", new THREE.BufferAttribute(pos, 3)); geo.setAttribute("normal", new THREE.BufferAttribute(nor, 3)); geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2)); geo.computeBoundingSphere();
+        const m0 = members[0], merged = new THREE.Mesh(geo, m0.material);
+        merged.castShadow = m0.castShadow; merged.receiveShadow = m0.receiveShadow; merged.renderOrder = m0.renderOrder; merged.matrixAutoUpdate = false; mergedRoot.add(merged);
+        const snap = members.map(m => ({ m, e: Float32Array.from(m.matrixWorld.elements), mat: m.material, s: sig(m.material) }));
+        for (const m of members) { used.add(m); m.layers.set(HIDDEN); }
+        batches.push({ merged, snap }); saved += members.length - 1;
+      }
+      renderer.shadowMap.needsUpdate = true; render();
+      return saved;
+    }
+    function dissolve(b) {
+      for (const { m } of b.snap) { m.layers.set(0); }
+      mergedRoot.remove(b.merged); b.merged.geometry.dispose(); b.dead = true;
+    }
+    setInterval(() => {
+      if (galleryMode || !batches.length) return;
+      let changed = false;
+      for (const b of batches) {
+        if (b.dead) continue;
+        for (const { m, e, mat, s: s0 } of b.snap) {
+          const w = m.matrixWorld.elements; let moved = !effVisible(m) || !m.parent || (m.material === mat && sig(mat) !== s0);
+          if (!moved) for (let i = 0; i < 16; i++) if (Math.abs(w[i] - e[i]) > 1e-5) { moved = true; break; }
+          if (moved) { dissolve(b); changed = true; break; }
+        }
+      }
+      if (changed) { for (let i = batches.length - 1; i >= 0; i--) if (batches[i].dead) batches.splice(i, 1); renderer.shadowMap.needsUpdate = true; render(); }
+    }, 500);
+    window.__mergeStaticRoom = mergeStatic;
+    setTimeout(mergeStatic, 6000); setTimeout(mergeStatic, 16000); setTimeout(mergeStatic, 40000);
+  }
+  window.__roomCam = { camera, controls, renderer, scene, render: () => render() };
   window.__leaveRoomModesNow = () => {
     const restore = sv => { if (!sv) return; controls.minDistance = sv.min; controls.maxDistance = sv.max; [controls.minPolarAngle, controls.maxPolarAngle] = sv.polar; [controls.minAzimuthAngle, controls.maxAzimuthAngle] = sv.az; controls.enabled = true; };
     cancelAnimationFrame(pcTween);
@@ -2139,9 +2214,12 @@
     if (document.hidden || now-lastRiverFrame < 40) return;
     const frameDelta=lastRiverFrame?now-lastRiverFrame:40;
     // Inside the drawing room only that scene is drawn; the night-room effects pause.
-    if (galleryMode) { lastRiverFrame=now; gallerySunTick?.(now); controls.update(); renderer.render(scene,camera); return; }
+    if (galleryMode) { lastRiverFrame=now; gallerySunTick?.(now); if(now-(window.__shadowAt||0)>400){window.__shadowAt=now;renderer.shadowMap.needsUpdate=true;} controls.update(); renderer.render(scene,camera); return; }
      lastRiverFrame=now; cityMaterial.uniforms.uTime.value=now*.001; updateStoryLights(now); animateExterior(now,frameDelta);
      animateWeather(now,frameDelta); animateBeacons(now); window.__deskFlicker?.(now); window.__pcScreenTick?.(now);
+     if(now-(window.__shadowAt||0)>400){window.__shadowAt=now;renderer.shadowMap.needsUpdate=true;}
+     // v57: adaptive sharpness — if frames are slow for a few seconds, render a little softer
+     window.__fps=window.__fps||{n:0,t:0,level:0};{const F=window.__fps;F.n++;F.t+=frameDelta;if(F.n>=60){const avg=F.t/F.n;F.n=0;F.t=0;const lv=[1.1,.9,.75];if(avg>55&&F.level<2){F.level++;renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,lv[F.level]));size();}}}
     const lampBlend=1-Math.exp(-frameDelta/260);
     deskLampLevel+=( (deskLampOn?1:0)-deskLampLevel )*lampBlend;
      bulb.intensity=3.6*deskLampLevel; lampSpot.intensity=13*deskLampLevel; deskWarm.intensity=.12+1.5*deskLampLevel;
